@@ -1,0 +1,1219 @@
+openapi: 3.0.3
+info:
+  title: Servicio de Calendario Multinacional API
+  version: "1.0.0"
+  description: |
+    API del servicio de calendario de una empresa multinacional (ejercicio ISWZ2202 · Semana 9).
+    Autor: **Alexander López**.
+
+    **Cómo se usa**
+    - Todas las rutas llevan la versión en la ruta (`/v1/...`).
+    - Quien llama se identifica con un token JWT (`Authorization: Bearer <token>`) obtenido en `POST /v1/sesiones`
+      (usuarios) o con OAuth 2.0 *client credentials* (servicios externos).
+    - El contenido de los calendarios se guarda cifrado; la API solo lo devuelve descifrado si el usuario
+      tiene permiso sobre el calendario. Sin permiso responde `403` (o `404` si ni siquiera puede saber que existe).
+    - Fechas en ISO 8601 con zona horaria; las zonas horarias usan nombres IANA (`America/Guayaquil`).
+    - Errores siempre con el mismo cuerpo `Error` (`codigo`, `mensaje`, `detalles`, `idTraza`).
+    - Concurrencia optimista: los recursos devuelven `ETag`; para modificar se envía `If-Match`.
+    - Las creaciones aceptan `Idempotency-Key` para que reintentos desde el móvil no dupliquen eventos.
+  contact:
+    name: Alexander López
+servers:
+  - url: https://api.calendario.example.com
+    description: Producción (Route 53 dirige a la región más cercana)
+  - url: https://api.staging.calendario.example.com
+    description: Pruebas
+
+tags:
+  - name: Sesiones
+    description: Identificación con usuario y contraseña, renovación y cierre de sesión
+  - name: Calendarios
+    description: Calendarios del usuario y compartidos con él
+  - name: Permisos
+    description: Quién puede ver o editar un calendario
+  - name: Eventos
+    description: Eventos de un calendario, incluidos los recurrentes
+  - name: Vistas
+    description: Vistas preparadas (día, semana, mes, agenda) para cada tipo de dispositivo
+  - name: Alertas
+    description: Alertas configuradas por el usuario sobre sus eventos
+  - name: Notificaciones
+    description: Avisos generados por las alertas y dispositivos que los reciben
+  - name: Webhooks
+    description: Suscripciones de servicios externos a cambios y alertas
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ------------------------------------------------------------------ SESIONES
+  /v1/sesiones:
+    post:
+      tags: [Sesiones]
+      summary: Iniciar sesión con usuario y contraseña
+      description: |
+        Valida las credenciales en el servicio de identidad. Si el usuario tiene MFA activo devuelve `202`
+        con un desafío que se completa en `POST /v1/sesiones/mfa`.
+      operationId: iniciarSesion
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credenciales' }
+            example: { usuario: alexander.lopez, contrasena: "S3gura!2026" }
+      responses:
+        '200':
+          description: Sesión iniciada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tokens' }
+        '202':
+          description: Falta el segundo factor (MFA)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DesafioMfa' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401':
+          description: Usuario o contraseña incorrectos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { codigo: CREDENCIALES_INVALIDAS, mensaje: "Usuario o contraseña incorrectos.", idTraza: "4f2a9c1e" }
+        '423':
+          description: Cuenta bloqueada temporalmente por intentos fallidos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/DemasiadasSolicitudes' }
+
+  /v1/sesiones/mfa:
+    post:
+      tags: [Sesiones]
+      summary: Completar el segundo factor
+      operationId: completarMfa
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idDesafio, codigo]
+              properties:
+                idDesafio: { type: string }
+                codigo: { type: string, pattern: '^[0-9]{6}$', example: "482913" }
+      responses:
+        '200':
+          description: Sesión iniciada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tokens' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401':
+          description: Código incorrecto o desafío vencido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/sesiones/renovacion:
+    post:
+      tags: [Sesiones]
+      summary: Renovar el token de acceso
+      operationId: renovarSesion
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tokenRenovacion]
+              properties:
+                tokenRenovacion: { type: string }
+      responses:
+        '200':
+          description: Nuevos tokens
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tokens' }
+        '401':
+          description: Token de renovación inválido, vencido o revocado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/sesiones/actual:
+    delete:
+      tags: [Sesiones]
+      summary: Cerrar la sesión actual
+      description: Revoca el token de renovación y el token de acceso en uso.
+      operationId: cerrarSesion
+      responses:
+        '204': { description: Sesión cerrada }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  # ------------------------------------------------------------------ CALENDARIOS
+  /v1/calendarios:
+    get:
+      tags: [Calendarios]
+      summary: Listar los calendarios a los que el usuario tiene acceso
+      operationId: listarCalendarios
+      security:
+        - bearerAuth: []
+        - oauth2: [calendarios.leer]
+      parameters:
+        - name: rol
+          in: query
+          description: Filtrar por el rol del usuario sobre el calendario
+          schema: { $ref: '#/components/schemas/Rol' }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limite'
+      responses:
+        '200':
+          description: Página de calendarios (solo metadatos; los eventos se piden aparte)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  datos:
+                    type: array
+                    items: { $ref: '#/components/schemas/Calendario' }
+                  paginacion: { $ref: '#/components/schemas/Paginacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '429': { $ref: '#/components/responses/DemasiadasSolicitudes' }
+    post:
+      tags: [Calendarios]
+      summary: Crear un calendario
+      description: El usuario que lo crea queda como dueño. Se genera una clave de datos propia para cifrarlo.
+      operationId: crearCalendario
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CalendarioNuevo' }
+            example: { nombre: "Proyecto Quito", zonaHoraria: America/Guayaquil, color: "#188038" }
+      responses:
+        '201':
+          description: Calendario creado
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Calendario' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '422': { $ref: '#/components/responses/NoProcesable' }
+
+  /v1/calendarios/{calendarioId}:
+    parameters:
+      - $ref: '#/components/parameters/CalendarioId'
+    get:
+      tags: [Calendarios]
+      summary: Obtener un calendario
+      operationId: obtenerCalendario
+      security:
+        - bearerAuth: []
+        - oauth2: [calendarios.leer]
+      responses:
+        '200':
+          description: Calendario
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Calendario' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    patch:
+      tags: [Calendarios]
+      summary: Modificar nombre, color, descripción o zona horaria
+      operationId: modificarCalendario
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CalendarioCambios' }
+      responses:
+        '200':
+          description: Calendario modificado
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Calendario' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '412': { $ref: '#/components/responses/VersionDesactualizada' }
+    delete:
+      tags: [Calendarios]
+      summary: Eliminar un calendario (solo el dueño)
+      description: Destruye la clave de datos del calendario, lo que deja ilegibles también las copias de respaldo.
+      operationId: eliminarCalendario
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204': { description: Calendario eliminado }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '412': { $ref: '#/components/responses/VersionDesactualizada' }
+
+  # ------------------------------------------------------------------ PERMISOS
+  /v1/calendarios/{calendarioId}/permisos:
+    parameters:
+      - $ref: '#/components/parameters/CalendarioId'
+    get:
+      tags: [Permisos]
+      summary: Listar quién tiene acceso al calendario
+      operationId: listarPermisos
+      responses:
+        '200':
+          description: Permisos del calendario
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Permiso' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    post:
+      tags: [Permisos]
+      summary: Compartir el calendario con otro usuario
+      description: Solo el dueño puede compartir. Un calendario tiene siempre exactamente un dueño.
+      operationId: compartirCalendario
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PermisoNuevo' }
+            example: { usuarioId: "usr_8f31", rol: lector }
+      responses:
+        '201':
+          description: Permiso concedido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Permiso' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409': { $ref: '#/components/responses/Conflicto' }
+
+  /v1/calendarios/{calendarioId}/permisos/{usuarioId}:
+    parameters:
+      - $ref: '#/components/parameters/CalendarioId'
+      - name: usuarioId
+        in: path
+        required: true
+        schema: { type: string }
+    put:
+      tags: [Permisos]
+      summary: Cambiar el rol de un usuario sobre el calendario
+      operationId: cambiarRol
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rol]
+              properties:
+                rol: { $ref: '#/components/schemas/RolCompartible' }
+      responses:
+        '200':
+          description: Rol actualizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Permiso' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    delete:
+      tags: [Permisos]
+      summary: Quitar el acceso de un usuario
+      operationId: revocarPermiso
+      responses:
+        '204': { description: Acceso revocado }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: No se puede quitar al dueño
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ------------------------------------------------------------------ EVENTOS
+  /v1/calendarios/{calendarioId}/eventos:
+    parameters:
+      - $ref: '#/components/parameters/CalendarioId'
+    get:
+      tags: [Eventos]
+      summary: Listar eventos de un rango de fechas
+      description: |
+        Verifica el permiso, descifra el calendario y devuelve los eventos del rango. Con
+        `expandirRecurrencias=true` devuelve cada repetición como una instancia.
+      operationId: listarEventos
+      security:
+        - bearerAuth: []
+        - oauth2: [calendarios.leer]
+      parameters:
+        - name: desde
+          in: query
+          required: true
+          schema: { type: string, format: date-time, example: "2026-11-23T00:00:00-05:00" }
+        - name: hasta
+          in: query
+          required: true
+          description: Máximo 366 días después de `desde`
+          schema: { type: string, format: date-time, example: "2026-11-30T00:00:00-05:00" }
+        - $ref: '#/components/parameters/ZonaHoraria'
+        - name: expandirRecurrencias
+          in: query
+          schema: { type: boolean, default: true }
+        - name: q
+          in: query
+          description: Texto a buscar en título o descripción
+          schema: { type: string, maxLength: 100 }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limite'
+      responses:
+        '200':
+          description: Página de eventos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  datos:
+                    type: array
+                    items: { $ref: '#/components/schemas/Evento' }
+                  paginacion: { $ref: '#/components/schemas/Paginacion' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '429': { $ref: '#/components/responses/DemasiadasSolicitudes' }
+    post:
+      tags: [Eventos]
+      summary: Crear un evento
+      description: Requiere rol `dueno` o `editor`. Publica `EventoModificado` en el bus de eventos.
+      operationId: crearEvento
+      security:
+        - bearerAuth: []
+        - oauth2: [calendarios.escribir]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventoNuevo' }
+            example:
+              titulo: Reunión de arquitectura
+              inicio: "2026-11-25T09:00:00"
+              fin: "2026-11-25T10:00:00"
+              zonaHoraria: America/Guayaquil
+              ubicacion: Sala 3 · UDLA Park
+              recurrencia: "FREQ=WEEKLY;BYDAY=WE;COUNT=8"
+              invitados: ["usr_8f31"]
+      responses:
+        '201':
+          description: Evento creado
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Evento' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '422': { $ref: '#/components/responses/NoProcesable' }
+
+  /v1/calendarios/{calendarioId}/eventos/{eventoId}:
+    parameters:
+      - $ref: '#/components/parameters/CalendarioId'
+      - $ref: '#/components/parameters/EventoId'
+    get:
+      tags: [Eventos]
+      summary: Obtener un evento
+      operationId: obtenerEvento
+      security:
+        - bearerAuth: []
+        - oauth2: [calendarios.leer]
+      parameters:
+        - $ref: '#/components/parameters/ZonaHoraria'
+      responses:
+        '200':
+          description: Evento
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Evento' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    put:
+      tags: [Eventos]
+      summary: Reemplazar un evento
+      description: |
+        Exige `If-Match` con el `ETag` leído. Si otra persona lo cambió antes, responde `412` y el cliente
+        debe mostrar la versión nueva antes de volver a guardar.
+      operationId: reemplazarEvento
+      security:
+        - bearerAuth: []
+        - oauth2: [calendarios.escribir]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/Alcance'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventoNuevo' }
+      responses:
+        '200':
+          description: Evento actualizado
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Evento' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '412': { $ref: '#/components/responses/VersionDesactualizada' }
+        '422': { $ref: '#/components/responses/NoProcesable' }
+        '428':
+          description: Falta el encabezado If-Match
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Eventos]
+      summary: Eliminar un evento, una repetición o desde una repetición en adelante
+      operationId: eliminarEvento
+      security:
+        - bearerAuth: []
+        - oauth2: [calendarios.escribir]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/Alcance'
+      responses:
+        '204': { description: Eliminado }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '412': { $ref: '#/components/responses/VersionDesactualizada' }
+
+  # ------------------------------------------------------------------ VISTAS
+  /v1/vistas/{tipo}:
+    get:
+      tags: [Vistas]
+      summary: Obtener una vista preparada del calendario
+      description: |
+        El servicio de vistas junta los eventos de uno o varios calendarios (solo los que el usuario puede ver),
+        los convierte a la zona horaria e idioma pedidos y los acomoda según el dispositivo.
+      operationId: obtenerVista
+      security:
+        - bearerAuth: []
+        - oauth2: [calendarios.leer]
+      parameters:
+        - name: tipo
+          in: path
+          required: true
+          schema: { type: string, enum: [dia, semana, mes, agenda] }
+        - name: fecha
+          in: query
+          required: true
+          description: Fecha de referencia de la vista
+          schema: { type: string, format: date, example: "2026-11-24" }
+        - name: calendarios
+          in: query
+          description: IDs de calendarios separados por coma; si se omite, todos los visibles
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: false
+        - $ref: '#/components/parameters/ZonaHoraria'
+        - name: dispositivo
+          in: query
+          schema: { type: string, enum: [web, movil, tablet, externo], default: web }
+        - name: Accept-Language
+          in: header
+          schema: { type: string, example: es-EC }
+      responses:
+        '200':
+          description: Vista lista para dibujar
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Vista' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+
+  # ------------------------------------------------------------------ ALERTAS
+  /v1/alertas:
+    get:
+      tags: [Alertas]
+      summary: Listar las alertas del usuario
+      operationId: listarAlertas
+      parameters:
+        - name: calendarioId
+          in: query
+          schema: { type: string }
+        - name: activa
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limite'
+      responses:
+        '200':
+          description: Página de alertas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  datos:
+                    type: array
+                    items: { $ref: '#/components/schemas/Alerta' }
+                  paginacion: { $ref: '#/components/schemas/Paginacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+    post:
+      tags: [Alertas]
+      summary: Configurar una alerta
+      description: |
+        Una alerta puede apuntar a un evento concreto o a una regla sobre un calendario
+        (por ejemplo, avisar 15 minutos antes de todo evento). El usuario debe poder ver el calendario.
+      operationId: crearAlerta
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AlertaNueva' }
+            example:
+              calendarioId: cal_51ab
+              eventoId: evt_9c20
+              disparador: { tipo: antes_del_inicio, minutos: 15 }
+              canales: [push, correo]
+      responses:
+        '201':
+          description: Alerta creada
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Alerta' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+        '422': { $ref: '#/components/responses/NoProcesable' }
+
+  /v1/alertas/{alertaId}:
+    parameters:
+      - name: alertaId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Alertas]
+      summary: Obtener una alerta
+      operationId: obtenerAlerta
+      responses:
+        '200':
+          description: Alerta
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Alerta' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    patch:
+      tags: [Alertas]
+      summary: Cambiar el disparador, los canales o pausar una alerta
+      operationId: modificarAlerta
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AlertaCambios' }
+      responses:
+        '200':
+          description: Alerta modificada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Alerta' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '422': { $ref: '#/components/responses/NoProcesable' }
+    delete:
+      tags: [Alertas]
+      summary: Eliminar una alerta
+      operationId: eliminarAlerta
+      responses:
+        '204': { description: Alerta eliminada }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  # ------------------------------------------------------------------ NOTIFICACIONES
+  /v1/notificaciones:
+    get:
+      tags: [Notificaciones]
+      summary: Bandeja de notificaciones del usuario
+      description: Es la misma información que llegó por push; sirve para los dispositivos que estaban apagados.
+      operationId: listarNotificaciones
+      parameters:
+        - name: leida
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limite'
+      responses:
+        '200':
+          description: Página de notificaciones
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  datos:
+                    type: array
+                    items: { $ref: '#/components/schemas/Notificacion' }
+                  paginacion: { $ref: '#/components/schemas/Paginacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /v1/notificaciones/{notificacionId}:
+    patch:
+      tags: [Notificaciones]
+      summary: Marcar una notificación como leída o posponerla
+      operationId: actualizarNotificacion
+      parameters:
+        - name: notificacionId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                leida: { type: boolean }
+                posponerMinutos: { type: integer, enum: [5, 10, 30, 60] }
+      responses:
+        '200':
+          description: Notificación actualizada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Notificacion' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /v1/dispositivos:
+    post:
+      tags: [Notificaciones]
+      summary: Registrar un dispositivo para recibir push
+      operationId: registrarDispositivo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DispositivoNuevo' }
+      responses:
+        '201':
+          description: Dispositivo registrado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dispositivo' }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /v1/dispositivos/{dispositivoId}:
+    delete:
+      tags: [Notificaciones]
+      summary: Dejar de enviar push a un dispositivo
+      operationId: eliminarDispositivo
+      parameters:
+        - name: dispositivoId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Dispositivo eliminado }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  # ------------------------------------------------------------------ WEBHOOKS
+  /v1/suscripciones-webhook:
+    get:
+      tags: [Webhooks]
+      summary: Listar las suscripciones del servicio externo
+      operationId: listarSuscripciones
+      security:
+        - oauth2: [webhooks.gestionar]
+      responses:
+        '200':
+          description: Suscripciones
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SuscripcionWebhook' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+    post:
+      tags: [Webhooks]
+      summary: Suscribir una URL a cambios o alertas de calendarios autorizados
+      description: Cada envío lleva la firma HMAC-SHA256 del cuerpo en el encabezado `X-Firma`.
+      operationId: crearSuscripcion
+      security:
+        - oauth2: [webhooks.gestionar]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SuscripcionWebhookNueva' }
+      responses:
+        '201':
+          description: Suscripción creada; el secreto se muestra solo esta vez
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuscripcionWebhook'
+                  - type: object
+                    properties:
+                      secreto: { type: string }
+        '400': { $ref: '#/components/responses/SolicitudInvalida' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/SinPermiso' }
+
+  /v1/suscripciones-webhook/{suscripcionId}:
+    delete:
+      tags: [Webhooks]
+      summary: Cancelar una suscripción
+      operationId: eliminarSuscripcion
+      security:
+        - oauth2: [webhooks.gestionar]
+      parameters:
+        - name: suscripcionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Suscripción cancelada }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token de acceso de 15 minutos emitido por el servicio de identidad (OIDC).
+    oauth2:
+      type: oauth2
+      description: Para servicios externos (OAuth 2.0 client credentials).
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.calendario.example.com/oauth2/token
+          scopes:
+            calendarios.leer: Leer calendarios y eventos autorizados por el usuario
+            calendarios.escribir: Crear y modificar eventos
+            webhooks.gestionar: Administrar suscripciones de webhooks
+
+  parameters:
+    CalendarioId:
+      name: calendarioId
+      in: path
+      required: true
+      schema: { type: string, example: cal_51ab }
+    EventoId:
+      name: eventoId
+      in: path
+      required: true
+      description: ID del evento; para una repetición, `evt_9c20_20261125` (evento + fecha)
+      schema: { type: string, example: evt_9c20 }
+    ZonaHoraria:
+      name: zonaHoraria
+      in: query
+      description: Zona horaria IANA en la que se devuelven las horas
+      schema: { type: string, default: UTC, example: America/Guayaquil }
+    Cursor:
+      name: cursor
+      in: query
+      description: Cursor opaco devuelto en `paginacion.siguiente`
+      schema: { type: string }
+    Limite:
+      name: limite
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: UUID para que un reintento no cree el recurso dos veces (válido 24 h)
+      schema: { type: string, format: uuid }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: ETag de la versión que se leyó
+      schema: { type: string, example: 'W/"7"' }
+    Alcance:
+      name: alcance
+      in: query
+      description: Para eventos recurrentes, a qué repeticiones afecta el cambio
+      schema: { type: string, enum: [instancia, siguientes, serie], default: serie }
+
+  headers:
+    ETag:
+      description: Versión del recurso para concurrencia optimista
+      schema: { type: string }
+    Location:
+      description: URL del recurso creado
+      schema: { type: string, format: uri }
+    RetryAfter:
+      description: Segundos que se debe esperar antes de reintentar
+      schema: { type: integer }
+
+  responses:
+    SolicitudInvalida:
+      description: Datos mal formados o faltantes
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            codigo: SOLICITUD_INVALIDA
+            mensaje: La solicitud tiene campos inválidos.
+            detalles: [{ campo: fin, problema: "Debe ser posterior a inicio" }]
+            idTraza: 9b1d2e77
+    NoAutenticado:
+      description: Falta el token o venció
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { codigo: NO_AUTENTICADO, mensaje: "Inicia sesión para continuar.", idTraza: "c03f11aa" }
+    SinPermiso:
+      description: El usuario se identificó pero no tiene el rol necesario sobre el calendario
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { codigo: SIN_PERMISO, mensaje: "Tu rol en este calendario es lector; no puedes editarlo.", idTraza: "71aa0b2c" }
+    NoEncontrado:
+      description: El recurso no existe o el usuario no puede saber que existe
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { codigo: NO_ENCONTRADO, mensaje: "El evento no existe.", idTraza: "e81c55d0" }
+    Conflicto:
+      description: El recurso ya existe o choca con el estado actual
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    VersionDesactualizada:
+      description: Otra persona modificó el recurso después de que lo leíste
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { codigo: VERSION_DESACTUALIZADA, mensaje: "Otra persona cambió este evento. Revisa la versión nueva antes de guardar.", idTraza: "2d9e8f10" }
+    NoProcesable:
+      description: Datos bien formados pero que violan una regla del negocio
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { codigo: REGLA_INCUMPLIDA, mensaje: "La regla de recurrencia genera más de 1000 repeticiones.", idTraza: "5a7c3e21" }
+    DemasiadasSolicitudes:
+      description: Se superó el límite de solicitudes de la puerta de enlace
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [codigo, mensaje]
+      properties:
+        codigo:
+          type: string
+          description: Código estable para que el cliente decida qué hacer
+          example: SIN_PERMISO
+        mensaje:
+          type: string
+          description: Texto para mostrar al usuario, en su idioma
+        detalles:
+          type: array
+          items:
+            type: object
+            properties:
+              campo: { type: string }
+              problema: { type: string }
+        idTraza:
+          type: string
+          description: ID para buscar la solicitud en los registros (X-Ray)
+
+    Credenciales:
+      type: object
+      required: [usuario, contrasena]
+      properties:
+        usuario: { type: string, example: alexander.lopez }
+        contrasena: { type: string, format: password, minLength: 8 }
+    Tokens:
+      type: object
+      required: [tokenAcceso, tokenRenovacion, expiraEn, tipo]
+      properties:
+        tokenAcceso: { type: string }
+        tokenRenovacion: { type: string }
+        expiraEn: { type: integer, description: Segundos de vida del token de acceso, example: 900 }
+        tipo: { type: string, enum: [Bearer] }
+    DesafioMfa:
+      type: object
+      properties:
+        idDesafio: { type: string }
+        metodo: { type: string, enum: [totp, sms, correo] }
+        expiraEn: { type: integer, example: 300 }
+
+    Rol:
+      type: string
+      enum: [dueno, editor, lector]
+    RolCompartible:
+      type: string
+      enum: [editor, lector]
+
+    Calendario:
+      type: object
+      required: [id, nombre, zonaHoraria, rol, creado]
+      properties:
+        id: { type: string, example: cal_51ab }
+        nombre: { type: string, example: Proyecto Quito }
+        descripcion: { type: string }
+        color: { type: string, pattern: '^#[0-9A-Fa-f]{6}$', example: "#188038" }
+        zonaHoraria: { type: string, example: America/Guayaquil }
+        rol: { $ref: '#/components/schemas/Rol' }
+        regionDatos: { type: string, description: Región donde se guardan los datos, example: us-east-1 }
+        creado: { type: string, format: date-time }
+        actualizado: { type: string, format: date-time }
+    CalendarioNuevo:
+      type: object
+      required: [nombre, zonaHoraria]
+      properties:
+        nombre: { type: string, minLength: 1, maxLength: 80 }
+        descripcion: { type: string, maxLength: 500 }
+        color: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
+        zonaHoraria: { type: string }
+    CalendarioCambios:
+      type: object
+      minProperties: 1
+      properties:
+        nombre: { type: string, minLength: 1, maxLength: 80 }
+        descripcion: { type: string, maxLength: 500 }
+        color: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
+        zonaHoraria: { type: string }
+
+    Permiso:
+      type: object
+      properties:
+        usuarioId: { type: string }
+        nombre: { type: string }
+        correo: { type: string, format: email }
+        rol: { $ref: '#/components/schemas/Rol' }
+        concedidoPor: { type: string }
+        concedido: { type: string, format: date-time }
+    PermisoNuevo:
+      type: object
+      required: [rol]
+      properties:
+        usuarioId: { type: string }
+        correo: { type: string, format: email, description: Alternativa a usuarioId }
+        rol: { $ref: '#/components/schemas/RolCompartible' }
+
+    EventoNuevo:
+      type: object
+      required: [titulo, inicio, fin, zonaHoraria]
+      properties:
+        titulo: { type: string, minLength: 1, maxLength: 200 }
+        descripcion: { type: string, maxLength: 5000 }
+        ubicacion: { type: string, maxLength: 200 }
+        todoElDia: { type: boolean, default: false }
+        inicio:
+          type: string
+          description: Hora local del evento (sin desfase); se interpreta con `zonaHoraria`
+          example: "2026-11-25T09:00:00"
+        fin: { type: string, example: "2026-11-25T10:00:00" }
+        zonaHoraria: { type: string, example: America/Guayaquil }
+        recurrencia:
+          type: string
+          description: Regla RRULE de RFC 5545
+          example: "FREQ=WEEKLY;BYDAY=WE;COUNT=8"
+        excepciones:
+          type: array
+          description: Fechas de repeticiones canceladas
+          items: { type: string, format: date }
+        invitados:
+          type: array
+          items: { type: string }
+        visibilidad: { type: string, enum: [normal, privado], default: normal }
+    Evento:
+      allOf:
+        - $ref: '#/components/schemas/EventoNuevo'
+        - type: object
+          required: [id, calendarioId, version]
+          properties:
+            id: { type: string, example: evt_9c20 }
+            calendarioId: { type: string }
+            idSerie: { type: string, description: Presente si es una repetición de un evento recurrente }
+            inicioUtc: { type: string, format: date-time }
+            finUtc: { type: string, format: date-time }
+            version: { type: integer, example: 7 }
+            creadoPor: { type: string }
+            actualizado: { type: string, format: date-time }
+
+    Vista:
+      type: object
+      properties:
+        tipo: { type: string, enum: [dia, semana, mes, agenda] }
+        zonaHoraria: { type: string }
+        idioma: { type: string, example: es-EC }
+        rango:
+          type: object
+          properties:
+            desde: { type: string, format: date-time }
+            hasta: { type: string, format: date-time }
+        dias:
+          type: array
+          items:
+            type: object
+            properties:
+              fecha: { type: string, format: date }
+              etiqueta: { type: string, example: "mar 24 nov" }
+              bloques:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    eventoId: { type: string }
+                    calendarioId: { type: string }
+                    titulo: { type: string }
+                    color: { type: string }
+                    inicio: { type: string, example: "09:00" }
+                    fin: { type: string, example: "10:00" }
+                    columna: { type: integer, description: Columna para dibujar eventos que se solapan }
+                    tieneAlerta: { type: boolean }
+
+    Disparador:
+      type: object
+      required: [tipo]
+      properties:
+        tipo:
+          type: string
+          enum: [antes_del_inicio, hora_fija, al_cambiar_evento]
+        minutos: { type: integer, minimum: 0, maximum: 40320, description: Para `antes_del_inicio` }
+        fechaHora: { type: string, format: date-time, description: Para `hora_fija` }
+    AlertaNueva:
+      type: object
+      required: [calendarioId, disparador, canales]
+      properties:
+        calendarioId: { type: string }
+        eventoId: { type: string, description: "Si se omite, la alerta aplica a todos los eventos del calendario" }
+        disparador: { $ref: '#/components/schemas/Disparador' }
+        canales:
+          type: array
+          minItems: 1
+          items: { type: string, enum: [push, correo, en_app, webhook] }
+        silencioNocturno: { type: boolean, default: true, description: No enviar push entre 22:00 y 07:00 hora local }
+    AlertaCambios:
+      type: object
+      minProperties: 1
+      properties:
+        disparador: { $ref: '#/components/schemas/Disparador' }
+        canales:
+          type: array
+          items: { type: string, enum: [push, correo, en_app, webhook] }
+        activa: { type: boolean }
+        silencioNocturno: { type: boolean }
+    Alerta:
+      allOf:
+        - $ref: '#/components/schemas/AlertaNueva'
+        - type: object
+          properties:
+            id: { type: string, example: alr_33f0 }
+            activa: { type: boolean }
+            proximoDisparo: { type: string, format: date-time }
+            creado: { type: string, format: date-time }
+
+    Notificacion:
+      type: object
+      properties:
+        id: { type: string }
+        alertaId: { type: string }
+        eventoId: { type: string }
+        titulo: { type: string, example: "Reunión de arquitectura en 15 min" }
+        cuerpo: { type: string, example: "09:00 – 10:00 · Sala 3" }
+        canal: { type: string, enum: [push, correo, en_app, webhook] }
+        estado: { type: string, enum: [pendiente, enviada, fallida, leida] }
+        enviada: { type: string, format: date-time }
+    DispositivoNuevo:
+      type: object
+      required: [plataforma, tokenPush]
+      properties:
+        plataforma: { type: string, enum: [ios, android, web] }
+        tokenPush: { type: string }
+        nombre: { type: string, example: "iPhone de Alexander" }
+        zonaHoraria: { type: string }
+        idioma: { type: string }
+    Dispositivo:
+      allOf:
+        - $ref: '#/components/schemas/DispositivoNuevo'
+        - type: object
+          properties:
+            id: { type: string }
+            registrado: { type: string, format: date-time }
+
+    SuscripcionWebhookNueva:
+      type: object
+      required: [url, eventos]
+      properties:
+        url: { type: string, format: uri, example: "https://erp.ejemplo.com/hooks/calendario" }
+        eventos:
+          type: array
+          minItems: 1
+          items: { type: string, enum: [evento.creado, evento.modificado, evento.eliminado, alerta.disparada] }
+        calendarios:
+          type: array
+          items: { type: string }
+    SuscripcionWebhook:
+      allOf:
+        - $ref: '#/components/schemas/SuscripcionWebhookNueva'
+        - type: object
+          properties:
+            id: { type: string }
+            activa: { type: boolean }
+            creado: { type: string, format: date-time }
+
+    Paginacion:
+      type: object
+      properties:
+        siguiente: { type: string, nullable: true, description: Cursor de la siguiente página; null si no hay más }
+        limite: { type: integer }
